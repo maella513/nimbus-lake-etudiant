@@ -189,8 +189,53 @@ def gold_journalier(silver: pa.Table, referentiel: pa.Table) -> pa.Table:
 
     `referentiel` (SCHEMA_REF) fournit le mfid de chaque station.
     """
-    raise NotImplementedError("Bloc 1 B5 — à compléter")
-
+    bas, haut = BORNES_T
+    t = silver["t_c"]
+    presente = pc.is_valid(t)
+    dans_bornes = pc.fill_null(
+        pc.and_(pc.greater_equal(t, bas), pc.less_equal(t, haut)), False
+    )
+    jour = pa.table({
+        "ic_id": silver["ic_id"],
+        "date": silver["ts"].cast(pa.date32()),
+        "presente": presente.cast(pa.int64()),
+        "rejetee": pc.and_(presente, pc.invert(dans_bornes)).cast(pa.int64()),
+        "t_ok": pc.if_else(dans_bornes, t, pa.scalar(None, pa.float64())),
+        "rr": silver["rr1_mm"],
+    })
+    agg = jour.group_by(["date", "ic_id"]).aggregate([
+        ("presente", "sum"), ("rejetee", "sum"),
+        ("t_ok", "min"), ("t_ok", "max"), ("rr", "sum"),
+    ])
+    n_obs = agg["presente_sum"]
+    n_rej = agg["rejetee_sum"]
+    retenues = pc.subtract(n_obs, n_rej)
+    nul = pa.scalar(None, pa.string())
+    statut = pc.if_else(
+        pc.greater_equal(retenues, 8), pa.scalar("quotidien"),
+        pc.if_else(
+            pc.greater_equal(retenues, 2), pa.scalar("partiel"),
+            pc.if_else(pc.equal(retenues, 1), pa.scalar("releve_unique"), nul),
+        ),
+    )
+    tn, tx = agg["t_ok_min"], agg["t_ok_max"]
+    mfid = pc.take(
+        referentiel["mfid"].combine_chunks(),
+        pc.index_in(agg["ic_id"], value_set=referentiel["ic_id"].combine_chunks()),
+    )
+    gold = pa.table({
+        "ic_id": agg["ic_id"],
+        "mfid": mfid,
+        "date": agg["date"],
+        "tn": tn,
+        "tx": tx,
+        "tm": pc.divide(pc.add(tn, tx), 2.0),
+        "rr": agg["rr_sum"],
+        "n_obs": n_obs,
+        "n_obs_rejetees": n_rej,
+        "statut_extremes": statut,
+    })
+    return gold.sort_by([("date", "ascending"), ("ic_id", "ascending")]).cast(SCHEMA_GOLD)
 
 @dataclass(frozen=True, slots=True)
 class RapportPipeline:
@@ -209,4 +254,27 @@ def executer_pipeline(racine_bronze: Path, racine_lake: Path) -> RapportPipeline
       pq.ParquetWriter (un row group par mois) ;
     - mémoire : un seul mois à la fois (consommer `silver_par_mois` en flux).
     """
-    raise NotImplementedError("Bloc 1 B6 — à compléter")
+    ref = lire_referentiel(racine_bronze / "ref" / "stations.csv")
+    fichier_gold = racine_lake / "gold" / "journaliere.parquet"
+    fichier_gold.parent.mkdir(parents=True, exist_ok=True)
+    fichiers_silver: list[Path] = []
+    n_silver = 0
+    n_gold = 0
+    with pq.ParquetWriter(fichier_gold, SCHEMA_GOLD, compression="zstd") as ecrivain:
+        for mois, silver in zip(mois_disponibles(racine_bronze), silver_par_mois(racine_bronze)):
+            dossier = racine_lake / "silver" / "observations" / f"annee={mois[:4]}"
+            dossier.mkdir(parents=True, exist_ok=True)
+            chemin = dossier / f"{mois}.parquet"
+            pq.write_table(silver, chemin, compression="zstd")
+            fichiers_silver.append(chemin)
+            n_silver += silver.num_rows
+            gold = gold_journalier(silver, ref)
+            ecrivain.write_table(gold)
+            n_gold += gold.num_rows
+    return RapportPipeline(
+        n_mois=len(fichiers_silver),
+        n_lignes_silver=n_silver,
+        n_lignes_gold=n_gold,
+        fichiers_silver=tuple(fichiers_silver),
+        fichier_gold=fichier_gold,
+    )
