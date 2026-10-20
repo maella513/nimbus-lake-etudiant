@@ -44,7 +44,13 @@ def ajouter_colonnes_partition(table: pa.Table) -> pa.Table:
 
     Le résultat suit SCHEMA_PARTITIONNABLE.
     """
-    raise NotImplementedError("Bloc 1 C1 — à compléter")
+    annee = pc.year(table["ts"]).cast(pa.int16())
+    mois = pc.month(table["ts"]).cast(pa.int8())
+    return (
+        table.append_column("annee", annee)
+        .append_column("mois", mois)
+        .cast(SCHEMA_PARTITIONNABLE)
+    )
 
 
 def ecrire_partitionne(tables: Iterable[pa.Table], racine: Path, cle: str) -> int:
@@ -55,7 +61,21 @@ def ecrire_partitionne(tables: Iterable[pa.Table], racine: Path, cle: str) -> in
       ds.write_dataset (avec `schema=`) ;
     - renvoie le nombre de fichiers Parquet écrits.
     """
-    raise NotImplementedError("Bloc 1 C2 — à compléter")
+    champs = [SCHEMA_PARTITIONNABLE.field(nom) for nom in CLES[cle]]
+    partitionnement = ds.partitioning(pa.schema(champs), flavor="hive") if champs else None
+
+    def lots() -> Iterator[pa.RecordBatch]:
+        for table in tables:
+            yield from ajouter_colonnes_partition(table).to_batches()
+
+    ds.write_dataset(
+        lots(),
+        racine,
+        schema=SCHEMA_PARTITIONNABLE,
+        format="parquet",
+        partitioning=partitionnement,
+    )
+    return compter_fichiers(racine)
 
 
 def ouvrir(racine: Path) -> ds.Dataset:
@@ -68,7 +88,7 @@ def fichiers_lus(racine: Path, filtre: pc.Expression) -> int:
 
     Indice : Dataset.get_fragments(filter=...) n'utilise que les valeurs de partition.
     """
-    raise NotImplementedError("Bloc 1 C3 — à compléter")
+    return len(list(ouvrir(racine).get_fragments(filter=filtre)))
 
 
 def moyenne_station_annee(racine: Path, ic_id: str, annee: int) -> tuple[int, float]:
@@ -76,7 +96,9 @@ def moyenne_station_annee(racine: Path, ic_id: str, annee: int) -> tuple[int, fl
 
     Doit fonctionner pour toutes les clés de CLES. Ne chargez que la colonne t_c.
     """
-    raise NotImplementedError("Bloc 1 C4 — à compléter")
+    filtre = (pc.field("ic_id") == ic_id) & (pc.field("annee") == annee)
+    t_c = ouvrir(racine).to_table(columns=["t_c"], filter=filtre)["t_c"]
+    return len(t_c), float(pc.mean(t_c).as_py())
 
 
 def compacter(source: Path, cible: Path, cle: str, lignes_par_fichier: int) -> int:
@@ -86,7 +108,18 @@ def compacter(source: Path, cible: Path, cle: str, lignes_par_fichier: int) -> i
     - row groups de 128 000 lignes au plus ;
     - renvoie le nombre de fichiers écrits.
     """
-    raise NotImplementedError("Bloc 1 C5 — à compléter")
+    source_ds = ouvrir(source)
+    champs = [source_ds.schema.field(nom) for nom in CLES[cle]]
+    partitionnement = ds.partitioning(pa.schema(champs), flavor="hive") if champs else None
+    ds.write_dataset(
+        source_ds,
+        cible,
+        format="parquet",
+        partitioning=partitionnement,
+        max_rows_per_file=lignes_par_fichier,
+        max_rows_per_group=min(128_000, lignes_par_fichier),
+    )
+    return compter_fichiers(cible)
 
 
 def gold_mensuel_duckdb(racine: Path) -> pa.Table:
@@ -96,7 +129,15 @@ def gold_mensuel_duckdb(racine: Path) -> pa.Table:
     triées par ic_id, annee, mois. Utilisez read_parquet(..., hive_partitioning = true).
     Comparez ensuite `EXPLAIN ANALYZE` avec et sans filtre sur annee.
     """
-    raise NotImplementedError("Bloc 1 Bonus — à compléter")
+    motif = f"{racine.as_posix()}/**/*.parquet"
+    return duckdb.sql(
+        f"""
+        SELECT ic_id, annee, mois, avg(t_c) AS t_moy, count(*) AS n
+        FROM read_parquet('{motif}', hive_partitioning = true)
+        GROUP BY ic_id, annee, mois
+        ORDER BY ic_id, annee, mois
+        """
+    ).to_arrow_table()
 
 
 def main() -> None:  # pragma: no cover - coquille impérative
