@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=2.0",
     "pyarrow>=18",
     "duckdb>=1.4",
+    "tzdata>=2026.5",
 ]
 
 [dependency-groups]

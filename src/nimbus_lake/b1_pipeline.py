@@ -78,7 +78,15 @@ def lire_referentiel(chemin: Path) -> pa.Table:
     - mfid vide -> null ;
     - dh_ouverture « 0000-00-00 00:00:00 » (date inconnue) -> null, pas une erreur de parsing.
     """
-    raise NotImplementedError("Bloc 1 B1 — à compléter")
+    return pacsv.read_csv(
+        chemin,
+        convert_options=pacsv.ConvertOptions(
+            column_types=SCHEMA_REF,
+            include_columns=SCHEMA_REF.names,
+            null_values=["", "0000-00-00 00:00:00"],
+            strings_can_be_null=True,
+        ),
+    )
 
 
 def canoniser_mf(brut: pa.Table, crosswalk: Mapping[str, str]) -> pa.Table:
@@ -88,8 +96,23 @@ def canoniser_mf(brut: pa.Table, crosswalk: Mapping[str, str]) -> pa.Table:
     - ts    : AAAAMMJJHH en UTC ;
     - t_c = T, u_pct = U, rr1_mm = RR1, source = "mf".
     """
-    raise NotImplementedError("Bloc 1 B2 — à compléter")
-
+    postes = pa.array(list(crosswalk.keys()), pa.string())
+    ic_ids = pa.array(list(crosswalk.values()), pa.string())
+    ic_id = pc.take(ic_ids, pc.index_in(brut["NUM_POSTE"], value_set=postes))
+    iso = pc.replace_substring_regex(
+        brut["AAAAMMJJHH"],
+        pattern=r"^(\d{4})(\d{2})(\d{2})(\d{2})$",
+        replacement=r"\1-\2-\3 \4:00:00",
+    )
+    ts = iso.cast(pa.timestamp("us")).cast(pa.timestamp("us", tz="UTC"))
+    return pa.table({
+        "ic_id": ic_id,
+        "ts": ts,
+        "t_c": brut["T"],
+        "u_pct": brut["U"],
+        "rr1_mm": brut["RR1"],
+        "source": pa.array(["mf"] * brut.num_rows, pa.string()),
+    }).cast(SCHEMA_SILVER)
 
 def lire_bronze_static(chemin: Path) -> pa.Table:
     """B3. Fichier JSON Lines du réseau participatif -> SCHEMA_SILVER.
@@ -101,7 +124,24 @@ def lire_bronze_static(chemin: Path) -> pa.Table:
       la minute 00, null aux minutes 15, 30 et 45 ;
     - source = "static".
     """
-    raise NotImplementedError("Bloc 1 B3 — à compléter")
+    brut = pajson.read_json(
+        chemin,
+        parse_options=pajson.ParseOptions(
+            explicit_schema=SCHEMA_STATIC_BRUT,
+            unexpected_field_behavior="ignore",
+        ),
+    )
+    ts = brut["dh_utc"].cast(pa.timestamp("us", tz="UTC"))
+    rr = pc.if_else(pc.equal(pc.minute(ts), 0), brut["precip_1h"],
+                    pa.scalar(None, pa.float64()))
+    return pa.table({
+        "ic_id": brut["ic_id"],
+        "ts": ts,
+        "t_c": pc.subtract(brut["air_temperature"], 273.15),
+        "u_pct": brut["relative_humidity"],
+        "rr1_mm": rr,
+        "source": pa.array(["static"] * brut.num_rows, pa.string()),
+    }).cast(SCHEMA_SILVER)
 
 
 def mois_disponibles(racine_bronze: Path) -> list[str]:
@@ -113,6 +153,14 @@ def mois_disponibles(racine_bronze: Path) -> list[str]:
             mois.add(m.group(1))
     return sorted(mois)
 
+def _dedoublonner(table: pa.Table) -> pa.Table:
+    """Garde la dernière ligne de chaque (ic_id, ts), puis trie par (ic_id, ts)."""
+    indexee = table.append_column("_i", pa.array(range(table.num_rows), pa.int64()))
+    derniers = indexee.group_by(["ic_id", "ts"]).aggregate([("_i", "max")])
+    return table.take(derniers["_i_max"]).sort_by(
+        [("ic_id", "ascending"), ("ts", "ascending")]
+    )
+
 
 def silver_par_mois(racine_bronze: Path) -> Iterator[pa.Table]:
     """B4. Générateur : une table Silver par mois, dans l'ordre chronologique.
@@ -122,7 +170,18 @@ def silver_par_mois(racine_bronze: Path) -> Iterator[pa.Table]:
     concaténer, retirer les doublons (même ic_id et même ts), trier par (ic_id, ts).
     Ne lisez pas le mois suivant avant d'avoir rendu le mois courant (`yield`).
     """
-    raise NotImplementedError("Bloc 1 B4 — à compléter")
+    ref = lire_referentiel(racine_bronze / "ref" / "stations.csv")
+    crosswalk = {m: i for m, i in zip(ref["mfid"].to_pylist(), ref["ic_id"].to_pylist()) if m}
+    for mois in mois_disponibles(racine_bronze):
+        tables = [
+            canoniser_mf(lire_bronze_mf(c), crosswalk)
+            for c in sorted((racine_bronze / "mf").glob(f"{mois}*.csv"))
+        ]
+        tables += [
+            lire_bronze_static(c)
+            for c in sorted((racine_bronze / "static").glob(f"{mois}*.jsonl"))
+        ]
+        yield _dedoublonner(pa.concat_tables(tables))
 
 
 def gold_journalier(silver: pa.Table, referentiel: pa.Table) -> pa.Table:
